@@ -1,0 +1,58 @@
+<h2>管理控制台布局</h2>
+<p class="subtitle">请选择最适合日常管理 Cursor 代理的页面骨架。三个方案都使用 React + shadcn/ui，包含密钥、审计日志和服务状态。</p>
+
+<div class="cards">
+  <div class="card" data-choice="sidebar" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">Cursor Tab Server <span style="float:right">管理员</span></div>
+        <div class="mockup-body" style="display:flex;min-height:235px">
+          <div class="mock-sidebar" style="width:34%;padding:12px">概览<br><br>API 密钥<br><br>审计日志<br><br>服务状态<br><br>设置</div>
+          <div class="mock-content" style="padding:16px;flex:1">
+            <div class="label">概览</div>
+            <h3>代理运行正常</h3>
+            <div class="placeholder" style="height:42px">请求量 · 成功率 · 延迟</div>
+            <br>
+            <div class="placeholder" style="height:70px">最近审计日志</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body"><h3>A. 固定侧边栏</h3><p>桌面管理工具风格。信息架构最清晰，密钥和日志等高频页面始终可达。</p></div>
+  </div>
+
+  <div class="card" data-choice="topnav" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">Cursor Tab Server <span style="float:right">概览　密钥　日志　状态　管理员</span></div>
+        <div class="mockup-body" style="padding:16px;min-height:235px">
+          <div class="label">概览</div>
+          <h3>代理运行正常</h3>
+          <div style="display:flex;gap:8px"><div class="placeholder" style="height:55px;flex:1">请求量</div><div class="placeholder" style="height:55px;flex:1">成功率</div><div class="placeholder" style="height:55px;flex:1">延迟</div></div>
+          <br><div class="placeholder" style="height:67px">最近审计日志</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body"><h3>B. 顶部导航</h3><p>更像简洁网站，窄屏适应较自然；但日志筛选等密集操作的导航效率较低。</p></div>
+  </div>
+
+  <div class="card" data-choice="compact" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">CTS <span style="float:right">日志　密钥　状态　退出</span></div>
+        <div class="mockup-body" style="padding:16px;min-height:235px">
+          <div class="label">实时活动</div>
+          <div class="placeholder" style="height:36px">过滤：密钥　路径　状态　时间</div>
+          <br><div class="placeholder" style="height:30px">200 · key_prod · StreamCpp · 182 ms</div>
+          <div class="placeholder" style="height:30px">200 · key_dev · CppConfig · 76 ms</div>
+          <div class="placeholder" style="height:30px">502 · key_prod · StreamCpp · 5.0 s</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body"><h3>C. 日志优先</h3><p>将审计流作为首页，适合高频排障；密钥和状态页的入口与总览较弱。</p></div>
+  </div>
+</div>
+
+<div class="section">
+  <p><strong>推荐 A：</strong>这是一个安全管理台而不是营销页面，固定侧边栏能明确区隔受控资源，并为后续配置项留出稳定入口。点击任一方案后，在聊天中告诉我你的选择或调整意见。</p>
+</div>
