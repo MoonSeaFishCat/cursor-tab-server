@@ -15,6 +15,7 @@ const (
 	SettingLoginRatePerMinute   = "login_rate_per_minute"
 	SettingLogRetentionDays     = "log_retention_days"
 	SettingCursorToken          = "cursor_token"
+	SettingAllowAnonymousProxy  = "allow_anonymous_proxy"
 )
 
 // SettingInt reads an integer override from the settings table. The second

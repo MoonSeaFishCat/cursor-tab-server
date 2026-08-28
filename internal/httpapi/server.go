@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -17,9 +19,11 @@ import (
 	"cursor-tab-server/internal/auth"
 	"cursor-tab-server/internal/captcha"
 	"cursor-tab-server/internal/config"
+	"cursor-tab-server/internal/coordination"
 	"cursor-tab-server/internal/proxy"
 	"cursor-tab-server/internal/ratelimit"
 	"cursor-tab-server/internal/store"
+	"cursor-tab-server/internal/tokenpool"
 )
 
 const (
@@ -29,11 +33,13 @@ const (
 )
 
 type Dependencies struct {
-	Config    config.Config
-	Store     *store.Store
-	Proxy     *proxy.Handler
-	Audit     *audit.Service
-	StartedAt time.Time
+	Config      config.Config
+	Store       *store.Store
+	Proxy       *proxy.Handler
+	TokenPool   *tokenpool.Pool
+	Coordinator *coordination.Coordinator
+	Audit       *audit.Service
+	StartedAt   time.Time
 }
 
 type Server struct {
@@ -41,6 +47,7 @@ type Server struct {
 	proxyLimit, adminLimit, captchaLimit *ratelimit.Limiter
 	loginLimit                           *ratelimit.Limiter
 	logRetentionDays                     int
+	allowAnonymousProxy                  bool
 	mux                                  *http.ServeMux
 }
 
@@ -77,15 +84,13 @@ func (s *Server) applyStoredSettings() {
 		{store.SettingCaptchaRatePerMinute, func(v int) { s.captchaLimit.SetLimit(v) }},
 		{store.SettingLoginRatePerMinute, func(v int) { s.loginLimit.SetLimit(v) }},
 		{store.SettingLogRetentionDays, func(v int) { s.logRetentionDays = v }},
+		{store.SettingAllowAnonymousProxy, func(v int) { s.allowAnonymousProxy = v != 0 }},
 	}
 	for _, override := range overrides {
 		value, ok, err := s.deps.Store.SettingInt(ctx, override.name)
 		if err == nil && ok {
 			override.apply(value)
 		}
-	}
-	if token, ok, err := s.deps.Store.SettingString(ctx, store.SettingCursorToken); err == nil && ok && strings.TrimSpace(token) != "" {
-		s.deps.Proxy.SetToken(token)
 	}
 }
 
@@ -103,8 +108,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/dashboard", s.adminOnly(s.dashboard))
 	s.mux.HandleFunc("GET /admin/settings", s.adminOnly(s.settings))
 	s.mux.HandleFunc("PUT /admin/settings", s.adminOnly(s.updateSettings))
+	s.mux.HandleFunc("GET /admin/cursor-tokens", s.adminOnly(s.listCursorTokens))
+	s.mux.HandleFunc("POST /admin/cursor-tokens", s.adminOnly(s.createCursorToken))
+	s.mux.HandleFunc("POST /admin/cursor-tokens/{id}/enable", s.adminOnly(s.enableCursorToken))
+	s.mux.HandleFunc("POST /admin/cursor-tokens/{id}/disable", s.adminOnly(s.disableCursorToken))
+	s.mux.HandleFunc("DELETE /admin/cursor-tokens/{id}", s.adminOnly(s.deleteCursorToken))
 	s.mux.HandleFunc("GET /admin/api-keys", s.adminOnly(s.listKeys))
 	s.mux.HandleFunc("POST /admin/api-keys", s.adminOnly(s.createKey))
+	s.mux.HandleFunc("POST /admin/api-keys/batch", s.adminOnly(s.batchKeys))
+	s.mux.HandleFunc("GET /admin/api-keys/{id}", s.adminOnly(s.keyDetail))
+	s.mux.HandleFunc("DELETE /admin/api-keys/{id}", s.adminOnly(s.deleteKey))
 	s.mux.HandleFunc("POST /admin/api-keys/{id}/disable", s.adminOnly(s.disableKey))
 	s.mux.HandleFunc("GET /admin/audit-logs", s.adminOnly(s.listAudit))
 	s.mux.HandleFunc("/", s.serveApplication)
@@ -112,7 +125,7 @@ func (s *Server) routes() {
 
 func (s *Server) createCaptcha(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
-	if !s.captchaLimit.Allow(clientIP(r), now) {
+	if !s.allow(r.Context(), "captcha", clientIP(r), s.captchaLimit, now) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -153,7 +166,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	if !s.loginLimit.Allow(clientIP(r), now) {
+	if !s.allow(r.Context(), "login", clientIP(r), s.loginLimit, now) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited")
 		return
 	}
@@ -187,7 +200,7 @@ func verifyCredentials(username, password, expectedUsername, expectedPassword st
 func (s *Server) adminOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r)
-		if !s.adminLimit.Allow(ip, time.Now()) {
+		if !s.allow(r.Context(), "admin", ip, s.adminLimit, time.Now()) {
 			writeError(w, http.StatusTooManyRequests, "rate_limited")
 			return
 		}
@@ -220,7 +233,25 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "database_unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"started_at": s.deps.StartedAt.UTC(), "database": "ok", "proxy_rate_per_minute": s.proxyLimit.Limit(), "admin_rate_per_minute": s.adminLimit.Limit(), "log_retention_days": s.logRetentionDays})
+	tokenCount, enabledTokens := 0, 0
+	if s.deps.TokenPool != nil {
+		if tokens, err := s.deps.TokenPool.List(r.Context()); err == nil {
+			tokenCount = len(tokens)
+			for _, token := range tokens {
+				if token.Enabled {
+					enabledTokens++
+				}
+			}
+		}
+	}
+	redisConnected := s.deps.Coordinator != nil && s.deps.Coordinator.RedisAvailable(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"started_at": s.deps.StartedAt.UTC(), "database": "ok",
+		"redis":         map[bool]string{true: "connected", false: "local_fallback"}[redisConnected],
+		"cursor_tokens": tokenCount, "enabled_cursor_tokens": enabledTokens,
+		"proxy_rate_per_minute": s.proxyLimit.Limit(), "admin_rate_per_minute": s.adminLimit.Limit(),
+		"log_retention_days": s.logRetentionDays,
+	})
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -242,59 +273,41 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
-	token := s.deps.Proxy.Token()
+	tokenCount := 0
+	if s.deps.TokenPool != nil {
+		if tokens, err := s.deps.TokenPool.List(r.Context()); err == nil {
+			tokenCount = len(tokens)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"listen_addr":             s.deps.Config.ListenAddr,
 		"database_path":           s.deps.Config.DatabasePath,
 		"proxy_rate_per_minute":   s.proxyLimit.Limit(),
 		"admin_rate_per_minute":   s.adminLimit.Limit(),
 		"log_retention_days":      s.logRetentionDays,
+		"allow_anonymous_proxy":   s.allowAnonymousProxy,
 		"captcha_rate_per_minute": s.captchaLimit.Limit(),
 		"login_rate_per_minute":   s.loginLimit.Limit(),
-		"cursor_token_set":        token != "",
-		"cursor_token_masked":     maskToken(token),
+		"cursor_token_set":        tokenCount > 0,
+		"cursor_token_masked":     "由 Token 池管理",
+		"cursor_token_count":      tokenCount,
 	})
-}
-
-// maskToken keeps only the outer edges of a credential visible so the admin
-// UI can confirm which token is active without exposing it.
-func maskToken(token string) string {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return ""
-	}
-	if len(token) <= 8 {
-		return "••••"
-	}
-	return token[:4] + "••••" + token[len(token)-4:]
 }
 
 // updateSettings persists online configuration changes and applies them to
 // the running server immediately.
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		ProxyRatePerMinute   *int    `json:"proxy_rate_per_minute"`
-		AdminRatePerMinute   *int    `json:"admin_rate_per_minute"`
-		CaptchaRatePerMinute *int    `json:"captcha_rate_per_minute"`
-		LoginRatePerMinute   *int    `json:"login_rate_per_minute"`
-		LogRetentionDays     *int    `json:"log_retention_days"`
-		CursorToken          *string `json:"cursor_token"`
+		ProxyRatePerMinute   *int  `json:"proxy_rate_per_minute"`
+		AdminRatePerMinute   *int  `json:"admin_rate_per_minute"`
+		CaptchaRatePerMinute *int  `json:"captcha_rate_per_minute"`
+		LoginRatePerMinute   *int  `json:"login_rate_per_minute"`
+		LogRetentionDays     *int  `json:"log_retention_days"`
+		AllowAnonymousProxy  *bool `json:"allow_anonymous_proxy"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&input) != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
-	}
-	if input.CursorToken != nil {
-		token := strings.TrimSpace(*input.CursorToken)
-		if len(token) < 10 || len(token) > 4096 {
-			writeError(w, http.StatusBadRequest, "invalid_cursor_token")
-			return
-		}
-		if err := s.deps.Store.SaveSettingString(r.Context(), store.SettingCursorToken, token); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error")
-			return
-		}
-		s.deps.Proxy.SetToken(token)
 	}
 	type editable struct {
 		name  string
@@ -326,15 +339,95 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		field.apply(*field.value)
 	}
+	if input.AllowAnonymousProxy != nil {
+		value := 0
+		if *input.AllowAnonymousProxy {
+			value = 1
+		}
+		if err := s.deps.Store.SaveSettingInt(r.Context(), store.SettingAllowAnonymousProxy, value); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error")
+			return
+		}
+		s.allowAnonymousProxy = *input.AllowAnonymousProxy
+	}
 	s.settings(w, r)
+}
+
+func (s *Server) listCursorTokens(w http.ResponseWriter, r *http.Request) {
+	if s.deps.TokenPool == nil {
+		writeError(w, http.StatusServiceUnavailable, "token_pool_unavailable")
+		return
+	}
+	items, err := s.deps.TokenPool.List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	redisConnected := s.deps.Coordinator != nil && s.deps.Coordinator.RedisAvailable(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items, "redis_connected": redisConnected, "strategy": "sticky_least_inflight",
+	})
+}
+
+func (s *Server) createCursorToken(w http.ResponseWriter, r *http.Request) {
+	if s.deps.TokenPool == nil {
+		writeError(w, http.StatusServiceUnavailable, "token_pool_unavailable")
+		return
+	}
+	var input struct {
+		Name  string `json:"name"`
+		Token string `json:"token"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&input) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	created, err := s.deps.TokenPool.Add(r.Context(), input.Name, input.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_cursor_token")
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) enableCursorToken(w http.ResponseWriter, r *http.Request) {
+	s.setCursorTokenEnabled(w, r, true)
+}
+
+func (s *Server) disableCursorToken(w http.ResponseWriter, r *http.Request) {
+	s.setCursorTokenEnabled(w, r, false)
+}
+
+func (s *Server) deleteCursorToken(w http.ResponseWriter, r *http.Request) {
+	if s.deps.TokenPool == nil {
+		writeError(w, http.StatusServiceUnavailable, "token_pool_unavailable")
+		return
+	}
+	if err := s.deps.TokenPool.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadRequest, "token_delete_rejected")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) setCursorTokenEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	if s.deps.TokenPool == nil {
+		writeError(w, http.StatusServiceUnavailable, "token_pool_unavailable")
+		return
+	}
+	if err := s.deps.TokenPool.SetEnabled(r.Context(), r.PathValue("id"), enabled); err != nil {
+		writeError(w, http.StatusBadRequest, "token_update_rejected")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Name string `json:"name"`
 	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input) != nil || strings.TrimSpace(input.Name) == "" {
-		writeError(w, http.StatusBadRequest, "name_required")
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
 	plain, prefix, hash, err := auth.CreateAPIKey(input.Name)
@@ -342,8 +435,13 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_key")
 		return
 	}
-	key := store.APIKey{ID: randomID(), Name: strings.TrimSpace(input.Name), Prefix: prefix, SecretHash: hash, CreatedAt: time.Now().UTC()}
-	if err = s.deps.Store.CreateAPIKey(r.Context(), key); err != nil {
+	name := strings.TrimSpace(input.Name)
+	createdAt := time.Now().UTC()
+	if name == "" {
+		name = "未命名密钥 " + createdAt.Format("20060102-150405")
+	}
+	key := store.APIKey{ID: randomID(), Name: name, Prefix: prefix, SecretHash: hash, CreatedAt: createdAt}
+	if err := s.deps.Store.CreateAPIKey(r.Context(), key); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error")
 		return
 	}
@@ -370,9 +468,88 @@ func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 			"disabled_at": key.DisabledAt, "last_used_at": key.LastUsedAt, "activity": activity[key.ID],
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": queryLimit(r), "offset": queryOffset(r)})
+	count, err := s.deps.Store.APIKeyCount(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": count, "limit": queryLimit(r), "offset": queryOffset(r)})
 }
 
+func (s *Server) keyDetail(w http.ResponseWriter, r *http.Request) {
+	key, err := s.deps.Store.GetAPIKey(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "key_not_found")
+		return
+	}
+	activity, err := s.deps.Audit.ActivityByKey(r.Context(), time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	logs, err := s.deps.Audit.QueryPage(r.Context(), audit.Query{APIKeyID: key.ID, Limit: queryLimit(r), Offset: queryOffset(r)})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": key.ID, "name": key.Name, "prefix": key.Prefix, "created_at": key.CreatedAt,
+		"disabled_at": key.DisabledAt, "last_used_at": key.LastUsedAt,
+		"activity": activity[key.ID], "logs": logs.Items, "logs_total": logs.Total,
+	})
+}
+
+func (s *Server) batchKeys(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		IDs    []string `json:"ids"`
+		Action string   `json:"action"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&input) != nil || len(input.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	ids := uniqueStrings(input.IDs)
+	var err error
+	switch input.Action {
+	case "enable":
+		err = s.deps.Store.SetAPIKeysEnabled(r.Context(), ids, true, time.Time{})
+	case "disable":
+		err = s.deps.Store.SetAPIKeysEnabled(r.Context(), ids, false, time.Now().UTC())
+	case "delete":
+		err = s.deps.Store.DeleteAPIKeys(r.Context(), ids)
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_action")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "batch_operation_failed")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
+	if err := s.deps.Store.DeleteAPIKeys(r.Context(), []string{r.PathValue("id")}); err != nil {
+		writeError(w, http.StatusNotFound, "key_not_found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			if _, ok := seen[value]; !ok {
+				seen[value] = struct{}{}
+				result = append(result, value)
+			}
+		}
+	}
+	return result
+}
 func (s *Server) disableKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -396,6 +573,13 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": page.Items, "total": page.Total, "limit": queryLimit(r), "offset": queryOffset(r)})
 }
 
+func (s *Server) allow(ctx context.Context, scope, subject string, limiter *ratelimit.Limiter, now time.Time) bool {
+	if s.deps.Coordinator != nil {
+		return s.deps.Coordinator.Allow(ctx, scope, subject, limiter.Limit(), time.Minute, now)
+	}
+	return limiter.Allow(subject, now)
+}
+
 func (s *Server) proxyOnly(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	apiKey := r.Header.Get("X-API-Key")
@@ -405,22 +589,31 @@ func (s *Server) proxyOnly(w http.ResponseWriter, r *http.Request) {
 	key, err := s.deps.Store.FindActiveAPIKeyByHash(r.Context(), auth.HashSecret(apiKey))
 	status, errorKind := 0, ""
 	if err != nil {
-		status, errorKind = http.StatusUnauthorized, "unauthorized"
-		writeError(w, status, errorKind)
-		s.record(r, key.ID, status, start, errorKind, 0, 0)
-		return
+		if apiKey != "" || !s.allowAnonymousProxy || !errors.Is(err, sql.ErrNoRows) {
+			status, errorKind = http.StatusUnauthorized, "unauthorized"
+			writeError(w, status, errorKind)
+			s.record(r, "", status, start, errorKind, 0, 0)
+			return
+		}
 	}
-	subject := key.ID + "|" + clientIP(r)
-	if !s.proxyLimit.Allow(subject, start) {
+	keyID := key.ID
+	subject := keyID + "|" + clientIP(r)
+	if keyID == "" {
+		subject = "anonymous|" + clientIP(r)
+	}
+	allowed := s.allow(r.Context(), "proxy", subject, s.proxyLimit, start)
+	if !allowed {
 		status, errorKind = http.StatusTooManyRequests, "rate_limited"
 		writeError(w, status, errorKind)
-		s.record(r, key.ID, status, start, errorKind, 0, 0)
+		s.record(r, keyID, status, start, errorKind, 0, 0)
 		return
 	}
-	_ = s.deps.Store.MarkAPIKeyUsed(r.Context(), key.ID, start)
+	if keyID != "" {
+		_ = s.deps.Store.MarkAPIKeyUsed(r.Context(), keyID, start)
+	}
 	rec := &captureWriter{ResponseWriter: w, status: http.StatusOK}
-	s.deps.Proxy.ServeHTTP(rec, r)
-	s.record(r, key.ID, rec.status, start, "", r.ContentLength, rec.bytes)
+	s.deps.Proxy.ServeForSubject(rec, r, subject)
+	s.record(r, keyID, rec.status, start, "", r.ContentLength, rec.bytes)
 }
 
 func (s *Server) record(r *http.Request, keyID string, status int, start time.Time, errorKind string, requestBytes, responseBytes int64) {

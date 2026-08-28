@@ -27,6 +27,9 @@ type Config struct {
 	AdminPassword      string
 	ListenAddr         string
 	DatabasePath       string
+	RedisURL           string
+	RedisPrefix        string
+	TokenKeyPath       string
 	ProxyRatePerMinute int
 	AdminRatePerMinute int
 }
@@ -54,12 +57,16 @@ func Load(path string) (Config, error) {
 	if password == "" {
 		return Config{}, fmt.Errorf("ADMIN_PASSWORD cannot be empty")
 	}
+	databasePath := envOrDefault("DATABASE_PATH", DefaultDatabasePath)
 	return Config{
 		CursorToken:        strings.TrimSpace(file.Token),
 		AdminUsername:      username,
 		AdminPassword:      password,
 		ListenAddr:         envOrDefault("LISTEN_ADDR", DefaultListenAddr),
-		DatabasePath:       envOrDefault("DATABASE_PATH", DefaultDatabasePath),
+		DatabasePath:       databasePath,
+		RedisURL:           strings.TrimSpace(os.Getenv("REDIS_URL")),
+		RedisPrefix:        envOrDefault("REDIS_PREFIX", "cursor-tab"),
+		TokenKeyPath:       envOrDefault("TOKEN_KEY_PATH", filepath.Join(filepath.Dir(databasePath), "token.key")),
 		ProxyRatePerMinute: envPositiveInt("PROXY_RATE_PER_MINUTE", defaultProxyRateLimit),
 		AdminRatePerMinute: envPositiveInt("ADMIN_RATE_PER_MINUTE", defaultAdminRateLimit),
 	}, nil

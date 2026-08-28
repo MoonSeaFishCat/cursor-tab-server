@@ -4,10 +4,13 @@
 
 ## 安全模型
 
-- 所有代理请求必须带 `X-API-Key`；也可使用查询参数 `?key=调用密钥`。调用密钥由管理控制台创建。
+- 代理请求默认必须带 `X-API-Key`；也可使用查询参数 `?key=调用密钥`。管理员可以在系统配置中显式开启无 Key 访问，此时请求按来源 IP 限流并以匿名请求记录。调用密钥由管理控制台创建。
 - 管理控制台使用 `ADMIN_USERNAME`、`ADMIN_PASSWORD` 和一次性图形验证码登录，并使用 8 小时的 `HttpOnly`、`Secure`、`SameSite=Strict` Cookie 会话。
 - 管理员密码、验证码答案和会话明文都不会写入 SQLite、审计日志或浏览器存储。
 - 调用密钥、管理员会话和验证码答案只保存 SHA-256 哈希；新调用密钥只会在创建时显示一次。
+- Cursor Token 支持多凭证池，并使用独立密钥进行 AES-GCM 加密后保存；控制台和接口只返回掩码。
+- 同一调用 API Key 默认粘到同一个 Cursor Token；凭证认证失败或被限流时，服务会冷却该 Token 并自动切换一次。
+- 可选 Redis 用于多实例共享限流、Token 粘性、健康状态和进行中请求计数；Redis 不可用时自动降级到单实例内存协调。
 - 审计日志默认保存 30 天，只记录请求元数据，不记录请求体、响应体、Cursor Token 或任意 API Key。
 - 服务默认绑定 `127.0.0.1:8041`。公网部署必须在 Caddy、Nginx 等 HTTPS 反向代理之后运行。
 
@@ -32,12 +35,27 @@ ADMIN_PASSWORD=请使用高强度密码
 go run .
 ```
 
+构建 Linux `amd64` 纯 Go 静态部署包（产物只包含一个可执行文件）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build-linux.ps1
+```
+
+产物位于 `release/`：`cursor-tab-server-linux-amd64` 和对应的 `cursor-tab-server-linux-amd64.tar.gz`。运行时仍需要挂载或创建 `config.yaml`，并通过环境变量提供管理员凭据；数据库目录与 `token.key` 用于持久化运行数据和加密凭证。
+
 可选环境变量：
 
 - `LISTEN_ADDR`：监听地址，默认 `127.0.0.1:8041`。
 - `DATABASE_PATH`：SQLite 文件，默认 `./data/cursor-tab-server.db`。
 - `PROXY_RATE_PER_MINUTE`：调用 API Key + 来源 IP 的每分钟请求数，默认 `120`。
 - `ADMIN_RATE_PER_MINUTE`：已登录管理接口的每来源 IP 每分钟请求数，默认 `30`。
+- 管理控制台“系统配置”可选择是否允许无 API Key 访问代理；默认关闭。开启后请求按来源 IP 限流，并以匿名请求写入审计日志。
+- 创建 API Key 时名称可留空，系统会自动生成名称。
+- `REDIS_URL`：可选 Redis 连接地址，例如 `redis://127.0.0.1:6379/0`；未配置或连接失败时使用本机内存协调。
+- `REDIS_PREFIX`：Redis 键前缀，默认 `cursor-tab`；同一集群中的所有服务实例必须一致。
+- `TOKEN_KEY_PATH`：Cursor Token 的 AES-GCM 加密密钥文件，默认与数据库同目录下的 `token.key`。
+
+首次启动会把 `config.yaml` 中的 Token 导入加密凭证池。之后可在控制台的“Token 池”页面添加和停用凭证；`config.yaml` 中的 Token 不会覆盖已经存在的池。请把 SQLite 数据库与 `token.key` 一起备份，丢失密钥后已加密的 Token 将无法恢复。
 
 打开 `https://你的域名/`，填写管理员用户名、密码和图形验证码；在“API 密钥”页面创建供客户端调用代理接口的密钥。
 

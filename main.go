@@ -13,9 +13,12 @@ import (
 
 	"cursor-tab-server/internal/audit"
 	"cursor-tab-server/internal/config"
+	"cursor-tab-server/internal/coordination"
 	"cursor-tab-server/internal/httpapi"
 	"cursor-tab-server/internal/proxy"
+	"cursor-tab-server/internal/secret"
 	"cursor-tab-server/internal/store"
+	"cursor-tab-server/internal/tokenpool"
 )
 
 const configPath = "./config.yaml"
@@ -33,16 +36,34 @@ func main() {
 	if err := database.Migrate(context.Background()); err != nil {
 		log.Fatal(err)
 	}
+
+	coordinator, err := coordination.New(cfg.RedisURL, cfg.RedisPrefix)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer coordinator.Close()
+	tokenCipher, err := secret.LoadOrCreate(cfg.TokenKeyPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tokens := tokenpool.New(database, tokenCipher, coordinator)
+	legacyToken := cfg.CursorToken
+	if stored, ok, readErr := database.SettingString(context.Background(), store.SettingCursorToken); readErr == nil && ok && stored != "" {
+		legacyToken = stored
+	}
+	if err := tokens.Bootstrap(context.Background(), legacyToken); err != nil {
+		log.Fatal(err)
+	}
+
 	auditService := audit.New(database)
 	stopCleanup := startCleanup(database, auditService)
 	defer stopCleanup()
-
+	proxyHandler := proxy.NewWithPool(tokens, &http.Client{Timeout: 30 * time.Second}, proxy.DefaultTargets())
 	server := &http.Server{
 		Addr: cfg.ListenAddr,
 		Handler: httpapi.New(httpapi.Dependencies{
-			Config: cfg, Store: database,
-			Proxy: proxy.New(cfg.CursorToken, &http.Client{Timeout: 30 * time.Second}, proxy.DefaultTargets()),
-			Audit: auditService, StartedAt: time.Now().UTC(),
+			Config: cfg, Store: database, Proxy: proxyHandler, TokenPool: tokens,
+			Coordinator: coordinator, Audit: auditService, StartedAt: time.Now().UTC(),
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

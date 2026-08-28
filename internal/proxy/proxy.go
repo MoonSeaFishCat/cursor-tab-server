@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -26,149 +26,200 @@ func DefaultTargets() map[string]string {
 	}
 }
 
+type Pool interface {
+	Acquire(context.Context, string, string) (id, token string, release func(), err error)
+	MarkSuccess(context.Context, string)
+	MarkFailure(context.Context, string, int)
+}
+
+type staticPool struct{ token string }
+
+func (p *staticPool) Acquire(context.Context, string, string) (string, string, func(), error) {
+	return "static", p.token, func() {}, nil
+}
+func (*staticPool) MarkSuccess(context.Context, string)      {}
+func (*staticPool) MarkFailure(context.Context, string, int) {}
+
 type Handler struct {
-	mu      sync.RWMutex
-	token   string
+	pool    Pool
 	client  *http.Client
 	targets map[string]string
 }
 
 func New(token string, client *http.Client, targets map[string]string) *Handler {
+	return NewWithPool(&staticPool{token: strings.TrimSpace(token)}, client, targets)
+}
+
+func NewWithPool(pool Pool, client *http.Client, targets map[string]string) *Handler {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	clone := map[string]string{}
-	for k, v := range targets {
-		clone[k] = v
+	for key, value := range targets {
+		clone[key] = value
 	}
-	return &Handler{token: strings.TrimSpace(token), client: client, targets: clone}
+	return &Handler{pool: pool, client: client, targets: clone}
 }
+
 func (h *Handler) Allowed(path string) bool { _, ok := h.targets[path]; return ok }
 
-// Token returns the Cursor access token currently used for upstream requests.
-func (h *Handler) Token() string {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.token
-}
-
-// SetToken swaps the Cursor access token at runtime so credential rotation
-// does not require a restart.
-func (h *Handler) SetToken(token string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.token = strings.TrimSpace(token)
-}
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.ServeForSubject(w, r, "anonymous")
+}
+
+func (h *Handler) ServeForSubject(w http.ResponseWriter, r *http.Request, subject string) {
 	target, ok := h.targets[r.URL.Path]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
+	body, err := readBody(w, r)
+	if err != nil {
+		return
+	}
+	leaseID, token, release, err := h.pool.Acquire(r.Context(), subject, "")
+	if err != nil {
+		http.Error(w, "no healthy cursor token available", http.StatusServiceUnavailable)
+		return
+	}
+	response, err := h.send(r, target, body, token)
+	if err != nil {
+		release()
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
+		return
+	}
+	if retryableTokenStatus(response.StatusCode) {
+		failedID := leaseID
+		h.pool.MarkFailure(r.Context(), failedID, response.StatusCode)
+		release()
+		_ = response.Body.Close()
+		leaseID, token, release, err = h.pool.Acquire(r.Context(), subject, failedID)
+		if err != nil {
+			http.Error(w, "no healthy cursor token available", http.StatusServiceUnavailable)
+			return
+		}
+		response, err = h.send(r, target, body, token)
+		if err != nil {
+			release()
+			http.Error(w, "upstream request failed", http.StatusBadGateway)
+			return
+		}
+	}
+	defer release()
+	defer response.Body.Close()
+	if retryableTokenStatus(response.StatusCode) {
+		h.pool.MarkFailure(r.Context(), leaseID, response.StatusCode)
+	} else {
+		h.pool.MarkSuccess(r.Context(), leaseID)
+	}
+	copyHeaders(w.Header(), response.Header)
+	w.WriteHeader(response.StatusCode)
+	_, _ = copyStream(w, response.Body)
+}
+
+func (h *Handler) send(r *http.Request, target string, body []byte, token string) (*http.Response, error) {
 	u, err := url.Parse(target)
 	if err != nil {
-		http.Error(w, "bad upstream", 502)
-		return
+		return nil, err
 	}
 	u.RawQuery = r.URL.RawQuery
 	query := u.Query()
 	query.Del("key")
 	u.RawQuery = query.Encode()
-	var body []byte
-	if r.Body != nil && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodDelete {
-		data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
-		if err != nil {
-			http.Error(w, "request body too large", 413)
-			return
-		}
-		body = data
-	}
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, "create upstream request", 502)
-		return
+		return nil, err
 	}
 	copyHeaders(req.Header, r.Header)
-	auth := bearer(h.Token())
-	req.Header.Set("Authorization", auth)
-	req.Header.Set("x-cursor-checksum", BuildChecksum(auth, time.Now()))
+	authorization := bearer(token)
+	req.Header.Set("Authorization", authorization)
+	req.Header.Set("x-cursor-checksum", BuildChecksum(authorization, time.Now()))
 	req.Header.Del("X-API-Key")
 	req.Host = u.Host
 	if len(body) > 0 {
 		req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
-	resp, err := h.client.Do(req)
-	if err != nil {
-		http.Error(w, "upstream request failed", 502)
-		return
-	}
-	defer resp.Body.Close()
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = copyStream(w, resp.Body)
+	return h.client.Do(req)
 }
+
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodDelete {
+		return nil, nil
+	}
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err != nil {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return nil, err
+	}
+	return data, nil
+}
+
+func retryableTokenStatus(status int) bool { return status == 401 || status == 403 || status == 429 }
+
 func copyHeaders(dst, src http.Header) {
 	connection := map[string]struct{}{}
-	for _, v := range src.Values("Connection") {
-		for _, name := range strings.Split(v, ",") {
+	for _, value := range src.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
 			connection[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
 		}
 	}
-	for k, values := range src {
-		lower := strings.ToLower(k)
+	for key, values := range src {
+		lower := strings.ToLower(key)
 		if _, skip := hopByHop[lower]; skip {
 			continue
 		}
 		if _, skip := connection[lower]; skip {
 			continue
 		}
-		for _, v := range values {
-			dst.Add(k, v)
+		for _, value := range values {
+			dst.Add(key, value)
 		}
 	}
 }
+
 func copyStream(w io.Writer, r io.Reader) (int64, error) {
-	buf := make([]byte, 32*1024)
+	buffer := make([]byte, 32*1024)
 	var total int64
 	for {
-		n, e := r.Read(buf)
-		if n > 0 {
-			m, we := w.Write(buf[:n])
-			total += int64(m)
-			if we != nil {
-				return total, we
+		read, readErr := r.Read(buffer)
+		if read > 0 {
+			written, writeErr := w.Write(buffer[:read])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
 			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
 			}
 		}
-		if e != nil {
-			if errors.Is(e, io.EOF) {
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
 				return total, nil
 			}
-			return total, e
+			return total, readErr
 		}
 	}
 }
+
 func bearer(token string) string {
 	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
 		return token
 	}
 	return "Bearer " + token
 }
+
 func BuildChecksum(authorization string, now time.Time) string {
 	timestamp := now.UnixMilli() / 1_000_000
 	bytes := make([]byte, 6)
 	value := big.NewInt(timestamp)
-	for i := range bytes {
-		shift := uint((len(bytes) - 1 - i) * 8)
-		bytes[i] = byte(new(big.Int).Rsh(value, shift).Uint64() & 0xff)
+	for index := range bytes {
+		shift := uint((len(bytes) - 1 - index) * 8)
+		bytes[index] = byte(new(big.Int).Rsh(value, shift).Uint64() & 0xff)
 	}
 	seed := 165
-	for i := range bytes {
-		current := (int(bytes[i]^byte(seed)) + i) & 0xff
-		bytes[i] = byte(current)
+	for index := range bytes {
+		current := (int(bytes[index]^byte(seed)) + index) & 0xff
+		bytes[index] = byte(current)
 		seed = current
 	}
 	prefix := strings.TrimRight(base64.StdEncoding.EncodeToString(bytes), "=")

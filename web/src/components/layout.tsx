@@ -1,6 +1,6 @@
 import { NavLink, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
-import { Activity, FileClock, Gauge, KeyRound, LogOut, Settings2, ShieldCheck } from 'lucide-react'
+import { Activity, FileClock, Gauge, KeyRound, LogOut, Network, Settings2, ShieldCheck } from 'lucide-react'
 import { useSession } from '../session'
 
 const sections = [
@@ -15,6 +15,7 @@ const sections = [
     label: '接入',
     items: [
       { to: '/api-keys', label: 'API 密钥', icon: KeyRound },
+      { to: '/tokens', label: 'Token 池', icon: Network },
       { to: '/audit-logs', label: '审计日志', icon: FileClock },
     ],
   },
@@ -28,6 +29,7 @@ const titles: Record<string, string> = {
   '/': '仪表盘',
   '/status': '服务状态',
   '/api-keys': 'API 密钥',
+  '/tokens': 'Token 池',
   '/audit-logs': '审计日志',
   '/settings': '系统配置',
 }
@@ -35,7 +37,7 @@ const titles: Record<string, string> = {
 export function AppShell({ children }: { children: ReactNode }) {
   const { logout } = useSession()
   const location = useLocation()
-  const current = titles[location.pathname] ?? '控制台'
+  const current = titles[location.pathname] ?? (location.pathname.startsWith('/api-keys/') ? 'API Key 详情' : '控制台')
 
   return (
     <div className="app">

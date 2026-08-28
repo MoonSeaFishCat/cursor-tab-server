@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import { KeyRound, RotateCcw, Save } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { RotateCcw, Save } from 'lucide-react'
 import { api, ApiError } from '../lib/api'
 import type { SystemSettings } from '../lib/types'
 import { Button } from '../components/ui/button'
@@ -61,6 +62,7 @@ function NumericField({ spec, value, onChange }: { spec: FieldSpec; value: strin
 
 export function SettingsPage() {
   const [settings, setSettings] = useState<SystemSettings>()
+  const [allowAnonymousProxy, setAllowAnonymousProxy] = useState(false)
   const [form, setForm] = useState<Record<NumericKey, string>>({
     proxy_rate_per_minute: '',
     admin_rate_per_minute: '',
@@ -71,13 +73,10 @@ export function SettingsPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
-  const [tokenInput, setTokenInput] = useState('')
-  const [tokenSaving, setTokenSaving] = useState(false)
-  const [tokenError, setTokenError] = useState('')
-  const [tokenSaved, setTokenSaved] = useState(false)
 
   const applySettings = (value: SystemSettings) => {
     setSettings(value)
+    setAllowAnonymousProxy(value.allow_anonymous_proxy)
     setForm({
       proxy_rate_per_minute: String(value.proxy_rate_per_minute),
       admin_rate_per_minute: String(value.admin_rate_per_minute),
@@ -92,6 +91,11 @@ export function SettingsPage() {
   }, [])
 
   const dirty = useMemo(() => {
+    if (!settings) return false
+    return (Object.keys(form) as NumericKey[]).some(key => form[key] !== String(settings[key])) || allowAnonymousProxy !== settings.allow_anonymous_proxy
+  }, [form, settings, allowAnonymousProxy])
+
+  const numericDirty = useMemo(() => {
     if (!settings) return false
     return (Object.keys(form) as NumericKey[]).some(key => form[key] !== String(settings[key]))
   }, [form, settings])
@@ -110,10 +114,11 @@ export function SettingsPage() {
   const save = async () => {
     setSaving(true)
     setError('')
-    const payload: Partial<Record<NumericKey, number>> = {}
+    const payload: Partial<Record<NumericKey, number>> & { allow_anonymous_proxy?: boolean } = {}
     for (const key of Object.keys(form) as NumericKey[]) {
       payload[key] = Number(form[key])
     }
+    payload.allow_anonymous_proxy = allowAnonymousProxy
     try {
       const updated = await api<SystemSettings>('/admin/settings', { method: 'PUT', body: JSON.stringify(payload) })
       applySettings(updated)
@@ -130,23 +135,6 @@ export function SettingsPage() {
     setError('')
   }
 
-  const saveToken = async () => {
-    const token = tokenInput.trim()
-    if (!token) return
-    setTokenSaving(true)
-    setTokenError('')
-    try {
-      const updated = await api<SystemSettings>('/admin/settings', { method: 'PUT', body: JSON.stringify({ cursor_token: token }) })
-      setSettings(updated)
-      setTokenInput('')
-      setTokenSaved(true)
-    } catch (cause) {
-      setTokenError(cause instanceof ApiError ? errorText[cause.code] ?? 'Token 保存失败，请检查后重试。' : 'Token 保存失败，请检查网络后重试。')
-    } finally {
-      setTokenSaving(false)
-    }
-  }
-
   return (
     <>
       <PageHeader
@@ -159,7 +147,7 @@ export function SettingsPage() {
               <RotateCcw size={14} />
               还原
             </Button>
-            <Button onClick={() => void save()} disabled={!dirty || invalid || saving}>
+            <Button onClick={() => void save()} disabled={!dirty || (numericDirty && invalid) || saving}>
               <Save size={14} />
               {saving ? '正在保存…' : '保存更改'}
             </Button>
@@ -174,31 +162,15 @@ export function SettingsPage() {
           ))}
         </Panel>
         <div className="settings-side">
-          <Panel title="Cursor 凭证" subtitle="代理转发上游时使用的 Cursor Token，保存后立即生效">
-            <label className="field">
-              <span className="field-label">当前令牌</span>
-              <input aria-label="当前令牌" value={settings ? (settings.cursor_token_set ? settings.cursor_token_masked : '未设置') : ''} readOnly className="readonly mono" />
-            </label>
-            <label className="field">
-              <span className="field-label">新令牌</span>
-              <input
-                type="password"
-                aria-label="新令牌"
-                value={tokenInput}
-                onChange={event => {
-                  setTokenInput(event.target.value)
-                  setTokenError('')
-                }}
-                placeholder="粘贴新的 Cursor Token"
-                autoComplete="off"
-              />
-              <span className="field-hint">保存后立即替换当前服务使用的 Token 并持久化到数据库，完整值不会再次显示。</span>
-            </label>
-            {tokenError && <p className="notice err">{tokenError}</p>}
+          <Panel title="访问策略" subtitle="控制代理是否接受不带 API Key 的请求">
+          <label className="switch-field"><input type="checkbox" aria-label="允许无 API Key 访问代理" checked={allowAnonymousProxy} disabled={!settings || saving} onChange={event => setAllowAnonymousProxy(event.target.checked)} /><span><strong>允许无 API Key 访问代理</strong><small>开启后按来源 IP 限流，并以匿名请求写入审计日志。默认关闭。</small></span></label>
+        </Panel>
+        <Panel title="Cursor 凭证" subtitle="代理转发所用的上游凭证由 Token 池统一调度">
+            <p className="muted">Cursor Token 由独立凭证池统一管理。</p>
+            <p className="field-hint">可在凭证池中添加多个加密 Token、查看健康状态，并随时启用或停用。</p>
             <div className="dialog-actions">
-              <Button onClick={() => void saveToken()} disabled={!tokenInput.trim() || tokenSaving}>
-                <KeyRound size={14} />
-                {tokenSaving ? '正在保存…' : '更新 Token'}
+              <Button asChild>
+                <Link to="/tokens">管理 Token 池</Link>
               </Button>
             </div>
           </Panel>
@@ -223,13 +195,6 @@ export function SettingsPage() {
         <div className="toasts">
           <Toast kind="ok" onClose={() => setSaved(false)}>
             配置已保存并立即生效
-          </Toast>
-        </div>
-      )}
-      {tokenSaved && (
-        <div className="toasts">
-          <Toast kind="ok" onClose={() => setTokenSaved(false)}>
-            Cursor Token 已更新并立即生效
           </Toast>
         </div>
       )}

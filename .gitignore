@@ -56,6 +56,9 @@ uploads/
 backend/uploads/
 backend/local_assets/
 instance/
+/release/
+data/
+*.key
 *.sqlite
 *.sqlite3
 *.db

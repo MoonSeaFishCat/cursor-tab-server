@@ -668,6 +668,86 @@ th {
     color: var(--ink-soft);
 }
 
+.pool-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 18px;
+    margin: -6px 0 18px;
+    color: var(--ink-muted);
+    font-size: 12.5px;
+}
+
+.batch-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: -8px 0 18px;
+    padding: 10px 12px;
+    border: 1px solid var(--accent-line);
+    border-radius: var(--radius);
+    background: var(--accent-soft);
+}
+
+.batch-toolbar strong {
+    margin-right: 4px;
+    color: var(--accent-deep);
+    font-size: 13px;
+}
+
+.select-cell {
+    width: 42px;
+    padding-right: 8px;
+    text-align: center;
+}
+
+.select-cell input,
+.switch-field input {
+    accent-color: var(--accent);
+}
+
+.switch-field {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+}
+
+.switch-field input {
+    width: 16px;
+    height: 16px;
+    margin: 3px 0 0;
+}
+
+.switch-field strong,
+.switch-field small {
+    display: block;
+}
+
+.switch-field strong {
+    color: var(--ink-soft);
+    font-size: 13px;
+}
+
+.switch-field small {
+    margin-top: 4px;
+    color: var(--ink-faint);
+    font-size: 12px;
+    font-weight: 400;
+}
+
+.detail-metrics {
+    margin-top: 20px;
+}
+
+.metric-unit {
+    margin-left: 4px;
+    color: var(--ink-muted);
+    font-size: 12px;
+    letter-spacing: 0;
+}
+
 /* ---------- Buttons ---------- */
 
 .button {

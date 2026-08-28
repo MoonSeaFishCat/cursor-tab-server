@@ -11,11 +11,14 @@ FROM golang:1.25 AS go-build
 WORKDIR /src
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+ENV GOARCH=amd64
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . ./
 COPY --from=web-build /src/internal/httpapi/assets/ ./internal/httpapi/assets/
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/cursor-tab-server .
+RUN go build -trimpath -tags "netgo osusergo" -ldflags="-s -w -extldflags=-static" -o /out/cursor-tab-server .
 
 FROM scratch
 

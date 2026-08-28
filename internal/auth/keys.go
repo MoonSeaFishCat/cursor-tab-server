@@ -6,15 +6,11 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
-	"strings"
 )
 
 const apiKeyPrefix = "cts_"
 
-func CreateAPIKey(name string) (plain string, prefix string, hash []byte, err error) {
-	if strings.TrimSpace(name) == "" {
-		return "", "", nil, fmt.Errorf("key name cannot be empty")
-	}
+func CreateAPIKey(_ string) (plain string, prefix string, hash []byte, err error) {
 	value, err := randomValue()
 	if err != nil {
 		return "", "", nil, err

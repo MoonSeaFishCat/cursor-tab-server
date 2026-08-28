@@ -16,6 +16,11 @@ export type ApiKey = {
   activity: ApiKeyActivity
 }
 
+export type ApiKeyDetail = ApiKey & {
+  logs: AuditLog[]
+  logs_total: number
+}
+
 export type AuditLog = {
   id: number
   occurred_at: string
@@ -65,10 +70,33 @@ export type SystemSettings = {
   log_retention_days: number
   cursor_token_set: boolean
   cursor_token_masked: string
+  allow_anonymous_proxy: boolean
+}
+
+export type CursorToken = {
+  id: string
+  name: string
+  masked: string
+  enabled: boolean
+  healthy: boolean
+  in_flight: number
+  created_at: string
+  updated_at: string
+  last_used_at?: string | null
+  last_error?: string
+}
+
+export type CursorTokenList = {
+  items: CursorToken[]
+  redis_connected: boolean
+  strategy: string
 }
 
 export type ServiceStatus = {
   database: string
+  redis: string
+  cursor_tokens: number
+  enabled_cursor_tokens: number
   started_at: string
   proxy_rate_per_minute: number
   admin_rate_per_minute: number

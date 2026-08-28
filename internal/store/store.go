@@ -47,6 +47,20 @@ var schema = []string{
 		value INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL
 	)`,
+	`CREATE TABLE IF NOT EXISTS cursor_tokens (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		ciphertext BLOB NOT NULL,
+		nonce BLOB NOT NULL,
+		masked TEXT NOT NULL,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		last_used_at INTEGER,
+		last_error TEXT NOT NULL DEFAULT '',
+		disabled_at INTEGER
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_cursor_tokens_enabled ON cursor_tokens(enabled, created_at)`,
 	`CREATE TABLE IF NOT EXISTS api_keys (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
